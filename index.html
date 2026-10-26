@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>間取りパース(ウォークイン・テクスチャ付き)</title>
+<style>
+  html,body { margin:0; height:100%; overflow:hidden; font-family:sans-serif; background:#dfeaf2; }
+  #info { position:absolute; top:10px; left:10px; background:rgba(255,255,255,.9);
+          padding:8px 12px; border-radius:6px; font-size:13px; line-height:1.9; z-index:10; }
+  button { margin:2px; cursor:pointer; }
+  #err { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+         color:#c00; font-size:16px; display:none; text-align:center; z-index:20; }
+  #cross { position:absolute; top:50%; left:50%; width:10px; height:10px; margin:-5px 0 0 -5px;
+           border:2px solid rgba(255,255,255,.9); border-radius:50%; display:none; z-index:10;
+           box-shadow:0 0 2px #000; pointer-events:none; }
+  #hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
+          background:rgba(0,0,0,.6); color:#fff; padding:8px 16px; border-radius:6px;
+          font-size:14px; display:none; z-index:10; text-align:center; pointer-events:none; }
+  #room { position:absolute; top:10px; right:10px; background:rgba(0,0,0,.6); color:#fff;
+          padding:6px 12px; border-radius:6px; font-size:14px; display:none; z-index:10; }
+</style>
+</head>
+<body>
+<div id="info">
+  <span id="helpOrbit">ドラッグ:回転 / ホイール:拡大縮小 / 右ドラッグ:移動</span><br>
+  <button onclick="toggleWalk()">ウォークイン ON/OFF (Enter)</button>
+  <button onclick="toggleRoof()">天井 ON/OFF</button>
+  <button onclick="toggleDoors()">建具 全開/全閉</button>
+  <button onclick="setView('top')">真上</button>
+  <button onclick="setView('iso')">斜め俯瞰</button>
+</div>
+<div id="err"></div>
+<div id="cross"></div>
+<div id="room"></div>
+<div id="hint">クリックで視点操作開始 / WASD:移動 / Shift:走る / E:ドア開閉 / Esc:マウス解除 / Enter:俯瞰に戻る</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+(function(){
+if (typeof THREE === 'undefined') {
+  var e = document.getElementById('err');
+  e.style.display = 'block';
+  e.innerHTML = 'Three.js を読み込めませんでした。<br>インターネット接続を確認して再読み込みしてください。';
+  return;
+}
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xcfe3f2);
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.05, 500);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.65);
+sun.position.set(-20, 40, 30); sun.castShadow = true;
+sun.shadow.camera.left=-40; sun.shadow.camera.right=40;
+sun.shadow.camera.top=40; sun.shadow.camera.bottom=-40;
+scene.add(sun);
+const indoor = new THREE.HemisphereLight(0xffffff, 0xbbaa88, 0.0);
+scene.add(indoor);
+
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+// ---------- テクスチャ生成(Canvas) ----------
+function makeTex(size, drawFn, repX, repY){
+  const cv=document.createElement('canvas'); cv.width=cv.height=size;
+  const c=cv.getContext('2d'); drawFn(c,size);
+  const t=new THREE.CanvasTexture(cv);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.repeat.set(repX||1,repY||1);
+  t.anisotropy=maxAniso;
+  return t;
+}
+function noise(c,s,n,alpha){
+  for(let i=0;i<n;i++){
+    const v=Math.random()<0.5?0:255;
+    c.fillStyle='rgba('+v+','+v+','+v+','+alpha+')';
+    c.fillRect(Math.random()*s,Math.random()*s,1.5,1.5);
+  }
+}
+// 畳:い草の縞+黒い縁(1枚=約 1.8m x 0.9m 想定。テクスチャは1畳ぶん)
+const texTatami = makeTex(256,(c,s)=>{
+  c.fillStyle='#a9c77a'; c.fillRect(0,0,s,s);
+  for(let y=0;y<s;y+=3){
+    c.fillStyle=(y/3)%2?'rgba(255,255,255,0.10)':'rgba(60,90,30,0.10)';
+    c.fillRect(0,y,s,2);
+  }
+  noise(c,s,600,0.06);
+  c.fillStyle='#1f2a1a';            // 畳縁(黒)
+  c.fillRect(0,0,s,10); c.fillRect(0,s-10,s,10);
+  c.fillStyle='#39482a';
+  c.fillRect(0,0,3,s); c.fillRect(s-3,0,3,s);
+});
+// フローリング(縦板)
+const texWood = makeTex(256,(c,s)=>{
+  const cols=['#e8c88e','#dfbb7c','#ebcf9a','#d9b27a'];
+  for(let i=0;i<4;i++){
+    c.fillStyle=cols[i]; c.fillRect(i*s/4,0,s/4,s);
+    for(let k=0;k<25;k++){
+      c.strokeStyle='rgba(120,80,30,0.12)'; c.beginPath();
+      const x=i*s/4+Math.random()*s/4; c.moveTo(x,0); c.lineTo(x+Math.random()*4-2,s); c.stroke();
+    }
+    c.fillStyle='rgba(90,55,20,0.55)'; c.fillRect(i*s/4,0,2,s);
+  }
+});
+// キッチン:ブルーグレー市松タイル
+const texKitchen = makeTex(256,(c,s)=>{
+  const n=4,w=s/n;
+  for(let y=0;y<n;y++)for(let x=0;x<n;x++){
+    c.fillStyle=(x+y)%2?'#f3e27a':'#e8d365'; c.fillRect(x*w,y*w,w,w);
+  }
+  c.strokeStyle='rgba(120,100,20,0.6)'; c.lineWidth=2;
+  for(let i=0;i<=n;i++){c.beginPath();c.moveTo(i*w,0);c.lineTo(i*w,s);c.stroke();
+                        c.beginPath();c.moveTo(0,i*w);c.lineTo(s,i*w);c.stroke();}
+});
+// 浴室・トイレ:水色タイル
+const texBath = makeTex(256,(c,s)=>{
+  const n=8,w=s/n;
+  c.fillStyle='#7fb6dc'; c.fillRect(0,0,s,s);
+  for(let y=0;y<n;y++)for(let x=0;x<n;x++){
+    c.fillStyle=(x+y)%2?'#8cc2e6':'#79b0d6'; c.fillRect(x*w+1,y*w+1,w-2,w-2);
+  }
+});
+// 玄関:石畳
+const texStone = makeTex(256,(c,s)=>{
+  c.fillStyle='#8d8a85'; c.fillRect(0,0,s,s);
+  for(let i=0;i<14;i++){
+    const x=Math.random()*s,y=Math.random()*s,w=40+Math.random()*50,h=30+Math.random()*40;
+    const g=90+Math.random()*50; c.fillStyle='rgb('+g+','+(g-3)+','+(g-8)+')';
+    c.fillRect(x,y,w,h); c.strokeStyle='#4a4845'; c.lineWidth=3; c.strokeRect(x,y,w,h);
+  }
+  noise(c,s,900,0.08);
+});
+// 押入:板張り
+const texOshiire = makeTex(256,(c,s)=>{
+  c.fillStyle='#b58a52'; c.fillRect(0,0,s,s);
+  for(let y=0;y<s;y+=32){
+    c.fillStyle=(y/32)%2?'#a87d47':'#bf9459'; c.fillRect(0,y,s,30);
+    c.fillStyle='rgba(60,35,10,0.6)'; c.fillRect(0,y+30,s,2);
+  }
+});
+// 壁(内壁):クリーム色の漆喰
+const texWallIn = makeTex(128,(c,s)=>{
+  c.fillStyle='#f6ecd2'; c.fillRect(0,0,s,s); noise(c,s,500,0.05);
+});
+// 外壁:白ベージュ+うっすら縦目地
+const texWallOut = makeTex(128,(c,s)=>{
+  c.fillStyle='#e6e2da'; c.fillRect(0,0,s,s);
+  c.fillStyle='rgba(120,110,95,0.35)'; c.fillRect(0,0,2,s); c.fillRect(s/2,0,2,s);
+  noise(c,s,400,0.05);
+});
+// 天井:明るい白+格子
+const texCeil = makeTex(128,(c,s)=>{
+  c.fillStyle='#fbfbfd'; c.fillRect(0,0,s,s);
+  c.strokeStyle='rgba(150,150,170,0.5)'; c.lineWidth=2; c.strokeRect(0,0,s,s);
+});
+
+// ---------- 地面 ----------
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200,200),
+  new THREE.MeshLambertMaterial({color:0x8fb573}));
+ground.rotation.x=-Math.PI/2; ground.position.y=-0.05; ground.receiveShadow=true;
+scene.add(ground);
+
+// ---------- 基本設定 ----------
+const S = 1/30, OX = 40, OY = 35;
+const H = 2.4, T = 0.15;
+const DOORH=2.0, WIN_Y=0.9, WIN_H=1.1;
+const px2w = (x,y)=>[(x-OX)*S,(y-OY)*S];
+
+// マテリアル(UVは面ごとに繰り返しを合わせて使う)
+const wallMatIn  = new THREE.MeshLambertMaterial({map:texWallIn});
+const wallMatOut = new THREE.MeshLambertMaterial({map:texWallOut});
+const baseboardMat = new THREE.MeshLambertMaterial({color:0x6b4423});   // 幅木:濃い茶
+const topLineMat   = new THREE.MeshLambertMaterial({color:0x8a6a45});   // 廻り縁
+const doorMat  = new THREE.MeshLambertMaterial({color:0x7a4a22});
+const shojiMat = new THREE.MeshLambertMaterial({color:0xfffbee,transparent:true,opacity:0.95});
+const frameMat = new THREE.MeshLambertMaterial({color:0x4a2f17});
+const glassMat = new THREE.MeshPhongMaterial({color:0x99ccff,transparent:true,opacity:0.35});
+const knobMat  = new THREE.MeshLambertMaterial({color:0xd4af37});
+
+const house = new THREE.Group(); scene.add(house);
+const roofGroup = new THREE.Group(); scene.add(roofGroup);
+const movers=[], fittings=[], colliders=[], labels=[];
+
+// ---------- 部屋 ----------
+// tex: テクスチャ, mpp: 1テクスチャあたりのメートル (repeat計算用)
+const rooms = [
+  {n:'浴室',    x:270,y:38, w:145,h:170,tex:texBath,   mx:1.0,my:1.0},
+  {n:'トイレ',  x:415,y:38, w:80, h:170,tex:texBath,   mx:1.0,my:1.0},
+  {n:'廊下(北)',x:42, y:208,w:453,h:58, tex:texWood,   mx:1.2,my:1.2},
+  {n:'玄関',    x:105,y:210,w:110,h:55, tex:texStone,  mx:1.0,my:1.0},
+  {n:'押入',    x:42, y:268,w:56, h:110,tex:texOshiire,mx:1.0,my:1.0},
+  {n:'和室',    x:105,y:270,w:165,h:220,tex:texTatami, tatami:true},
+  {n:'玄関',    x:42, y:382,w:56, h:108,tex:texStone,  mx:1.0,my:1.0},
+  {n:'キッチン8帖',x:275,y:268,w:220,h:222,tex:texKitchen,mx:1.0,my:1.0},
+  {n:'廊下',    x:42, y:492,w:453,h:56, tex:texWood,   mx:1.2,my:1.2},
+  {n:'廊下7.2帖',x:42,y:548,w:56, h:255,tex:texWood,   mx:1.2,my:1.2},
+  {n:'廊下',    x:42, y:803,w:453,h:25, tex:texWood,   mx:1.2,my:1.2},
+  {n:'和室',    x:100,y:550,w:170,h:250,tex:texTatami, tatami:true},
+  {n:'和室',    x:275,y:550,w:220,h:165,tex:texTatami, tatami:true},
+  {n:'和室',    x:275,y:722,w:165,h:80, tex:texTatami, tatami:true},
+  {n:'押入',    x:445,y:722,w:50, h:80, tex:texOshiire,mx:1.0,my:1.0},
+];
+const roomRects=[];
+rooms.forEach(r=>{
+  const [wx,wz]=px2w(r.x,r.y), w=r.w*S, d=r.h*S;
+  roomRects.push({n:r.n,x0:wx,x1:wx+w,z0:wz,z1:wz+d});
+
+  // 床面はテクスチャをクローンして個別にrepeat設定
+  const tex=r.tex.clone(); tex.needsUpdate=true;
+  tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
+  if(r.tatami){
+    // 畳1枚 = 1.8m(長辺) x 0.9m(短辺)。縁が長辺側の端に来るよう縦横を部屋に合わせる
+    tex.repeat.set(w/0.9, d/1.8);
+  } else {
+    tex.repeat.set(w/r.mx, d/r.my);
+  }
+  const f=new THREE.Mesh(new THREE.BoxGeometry(w,0.1,d),
+    [null,null,null,null,null,null].map((_,i)=> i===2
+      ? new THREE.MeshLambertMaterial({map:tex})
+      : new THREE.MeshLambertMaterial({color:0x777777})));
+  f.position.set(wx+w/2,0.05,wz+d/2); f.receiveShadow=true; house.add(f);
+
+  // ラベル
+  const cv=document.createElement('canvas'); cv.width=256; cv.height=64;
+  const cx=cv.getContext('2d'); cx.fillStyle='rgba(255,255,255,.85)'; cx.fillRect(0,0,256,64);
+  cx.fillStyle='#222'; cx.font='bold 28px sans-serif'; cx.textAlign='center';
+  cx.textBaseline='middle'; cx.fillText(r.n,128,32);
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(cv)}));
+  sp.scale.set(2.2,0.55,1); sp.position.set(wx+w/2,0.9,wz+d/2); house.add(sp);
+  labels.push(sp);
+});
+
+// ---------- 衝突 ----------
+function addCollider(cx,cz,len,rot,thick,fit){
+  const horizontal = Math.abs(Math.sin(rot))<0.5;
+  const hx=(horizontal?len:thick)/2, hz=(horizontal?thick:len)/2;
+  const c={minX:cx-hx,maxX:cx+hx,minZ:cz-hz,maxZ:cz+hz,fit:fit||null};
+  colliders.push(c); return c;
+}
+
+// ---------- 壁セグメント(内外で別マテリアル+幅木+廻り縁) ----------
+const wallsDef = [
+  // 外周 (outer:true)
+  [42,208,42,828,true],[42,828,495,828,true],[495,38,495,828,true],
+  [270,38,495,38,true],[270,38,270,208,true],[42,208,270,208,true],
+  // 内壁
+  [415,38,415,208],[270,208,495,208],
+  [42,266,270,266],[270,266,270,490],[275,266,495,266],[42,490,270,490],
+  [275,490,495,490],[98,266,98,490],[42,380,98,380],
+  [98,548,495,548],[98,548,98,805],[98,805,270,805],
+  [272,548,272,805],[272,718,495,718],[440,718,440,805],[272,805,495,805],
+];
+function makeWallMat(len,h,outer){
+  const t=(outer?texWallOut:texWallIn).clone(); t.needsUpdate=true;
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(Math.max(len/1.5,0.3),Math.max(h/1.5,0.3));
+  return new THREE.MeshLambertMaterial({map:t});
+}
+function addWallSeg(len,h,cx,cy,cz,rot,collide,outer,yBottom){
+  if(len<0.02||h<0.02) return;
+  const m=new THREE.Mesh(new THREE.BoxGeometry(len,h,T),makeWallMat(len,h,outer));
+  m.position.set(cx,cy,cz); m.rotation.y=rot; m.castShadow=true; m.receiveShadow=true; house.add(m);
+  // 幅木(床近く)と廻り縁(天井近く)
+  if(yBottom!==undefined && yBottom<0.05){
+    const bb=new THREE.Mesh(new THREE.BoxGeometry(len,0.12,T+0.03),baseboardMat);
+    bb.position.set(cx,0.06+0.05,cz); bb.rotation.y=rot; house.add(bb);
+  }
+  const top=cy+h/2;
+  if(Math.abs(top-H)<0.01){
+    const tl=new THREE.Mesh(new THREE.BoxGeometry(len,0.07,T+0.03),topLineMat);
+    tl.position.set(cx,H-0.035,cz); tl.rotation.y=rot; house.add(tl);
+  }
+  if(collide) addCollider(cx,cz,len,rot,T,null);
+}
+
+// ---------- 建具 ----------
+function buildFitting(o,mx,mz,ow,rot){
+  const g=new THREE.Group(); g.position.set(mx,0,mz); g.rotation.y=rot; house.add(g);
+  const fit={type:o.type,x:mx,z:mz,open:false,parts:[],collider:null};
+  fittings.push(fit);
+
+  if(o.type==='door'){
+    const fr=new THREE.Mesh(new THREE.BoxGeometry(ow,0.07,T+0.03),frameMat);
+    fr.position.y=DOORH; g.add(fr);
+    for(const sx of [-1,1]){
+      const jb=new THREE.Mesh(new THREE.BoxGeometry(0.06,DOORH,T+0.03),frameMat);
+      jb.position.set(sx*(ow/2-0.03),DOORH/2,0); g.add(jb);
+    }
+    const pivot=new THREE.Group(); pivot.position.set(-ow/2,0,0); g.add(pivot);
+    const leaf=new THREE.Mesh(new THREE.BoxGeometry(ow-0.08,DOORH-0.05,0.05),doorMat);
+    leaf.position.set(ow/2,DOORH/2,0); leaf.castShadow=true; pivot.add(leaf);
+    const knob=new THREE.Mesh(new THREE.SphereGeometry(0.045),knobMat);
+    knob.position.set(ow-0.14,1.0,0.05); pivot.add(knob);
+    const m={type:'swing',obj:pivot,cur:0,target:0,max:-Math.PI/2*0.95};
+    movers.push(m); fit.parts.push(m);
+    fit.collider=addCollider(mx,mz,ow,rot,0.12,fit);
+  }
+  else if(o.type==='slide'){
+    const rl=new THREE.Mesh(new THREE.BoxGeometry(ow*2,0.03,0.1),frameMat); rl.position.y=0.11; g.add(rl);
+    const ru=new THREE.Mesh(new THREE.BoxGeometry(ow*2,0.06,0.1),frameMat); ru.position.y=DOORH; g.add(ru);
+    for(let i=0;i<2;i++){
+      const pnl=new THREE.Group();
+      const w=ow/2+0.03;
+      const body=new THREE.Mesh(new THREE.BoxGeometry(w,DOORH-0.14,0.035),shojiMat);
+      body.position.y=(DOORH-0.14)/2+0.13; pnl.add(body);
+      for(let k=1;k<4;k++){
+        const bar=new THREE.Mesh(new THREE.BoxGeometry(w,0.018,0.045),frameMat);
+        bar.position.y=0.13+(DOORH-0.14)*k/4; pnl.add(bar);
+      }
+      for(const vx of [-w/2+0.01,0,w/2-0.01]){
+        const vb=new THREE.Mesh(new THREE.BoxGeometry(0.02,DOORH-0.14,0.045),frameMat);
+        vb.position.set(vx,(DOORH-0.14)/2+0.13,0); pnl.add(vb);
+      }
+      pnl.position.set(i===0?-ow/4:ow/4,0,i===0?-0.03:0.03);
+      g.add(pnl);
+      const m={type:'slide',obj:pnl,cur:0,target:0,base:pnl.position.x,dir:i===0?1:-1,dist:ow/2*0.9};
+      movers.push(m); fit.parts.push(m);
+    }
+    fit.collider=addCollider(mx,mz,ow,rot,0.12,fit);
+  }
+  else if(o.type==='window'){
+    const fw=new THREE.Mesh(new THREE.BoxGeometry(ow,0.06,T+0.03),frameMat);
+    fw.position.y=WIN_Y; g.add(fw);
+    const fw2=fw.clone(); fw2.position.y=WIN_Y+WIN_H; g.add(fw2);
+    for(const sx of [-1,1]){
+      const sd=new THREE.Mesh(new THREE.BoxGeometry(0.05,WIN_H,T+0.03),frameMat);
+      sd.position.set(sx*(ow/2-0.025),WIN_Y+WIN_H/2,0); g.add(sd);
+    }
+    for(let i=0;i<2;i++){
+      const gl=new THREE.Mesh(new THREE.BoxGeometry(ow/2,WIN_H,0.02),glassMat);
+      gl.position.set(i===0?-ow/4:ow/4,WIN_Y+WIN_H/2,i===0?-0.025:0.025); g.add(gl);
+    }
+    const mid=new THREE.Mesh(new THREE.BoxGeometry(0.04,WIN_H,0.06),frameMat);
+    mid.position.y=WIN_Y+WIN_H/2; g.add(mid);
+    addCollider(mx,mz,ow,rot,T,null);
+  }
+  else if(o.type==='open'){
+    const fr=new THREE.Mesh(new THREE.BoxGeometry(ow,0.06,T+0.03),frameMat);
+    fr.position.y=DOORH; g.add(fr);
+    for(const sx of [-1,1]){
+      const jb=new THREE.Mesh(new THREE.BoxGeometry(0.05,DOORH,T+0.03),frameMat);
+      jb.position.set(sx*(ow/2-0.025),DOORH/2,0); g.add(jb);
+    }
+  }
+}
+
+const openings = [
+  {x:160,y:208,type:'door',  w:60},
+  {x:42, y:435,type:'slide', w:50},
+  {x:340,y:208,type:'door',  w:38},
+  {x:455,y:208,type:'door',  w:38},
+  {x:98, y:320,type:'slide', w:60},
+  {x:270,y:400,type:'slide', w:60},
+  {x:300,y:266,type:'open',  w:50},
+  {x:300,y:490,type:'open',  w:50},
+  {x:160,y:490,type:'open',  w:60},
+  {x:272,y:600,type:'slide', w:60},
+  {x:272,y:665,type:'slide', w:50},
+  {x:330,y:718,type:'slide', w:60},
+  {x:390,y:718,type:'slide', w:60},
+  {x:98, y:640,type:'slide', w:80},
+  {x:467,y:722,type:'slide', w:50},
+  {x:495,y:660,type:'window',w:70},
+  {x:340,y:805,type:'window',w:70},
+];
+
+wallsDef.forEach(([x1,y1,x2,y2,outer])=>{
+  const [ax,az]=px2w(x1,y1),[bx,bz]=px2w(x2,y2);
+  const len=Math.hypot(bx-ax,bz-az); if(len<0.02) return;
+  const rot=-Math.atan2(bz-az,bx-ax);
+  const dx=(bx-ax)/len, dz=(bz-az)/len;
+  const ops=[];
+  openings.forEach(o=>{
+    const [ox,oz]=px2w(o.x,o.y);
+    const t=(ox-ax)*dx+(oz-az)*dz;
+    const dist=Math.abs((ox-ax)*dz-(oz-az)*dx);
+    if(dist<0.25 && t>0 && t<len) ops.push({t,ow:o.w*S,o});
+  });
+  ops.sort((a,b)=>a.t-b.t);
+  let cur=0;
+  const P=(t)=>[ax+dx*t,az+dz*t];
+  ops.forEach(op=>{
+    const s=Math.max(cur,op.t-op.ow/2), e=Math.min(len,op.t+op.ow/2);
+    if(e<=s) return;
+    { const [px,pz]=P((cur+s)/2); addWallSeg(s-cur,H,px,H/2,pz,rot,true,outer,0); }
+    const [mx,mz]=P((s+e)/2), ow=e-s;
+    if(op.o.type==='window'){
+      addWallSeg(ow,WIN_Y,mx,WIN_Y/2,mz,rot,false,outer,0);
+      addWallSeg(ow,H-WIN_Y-WIN_H,mx,WIN_Y+WIN_H+(H-WIN_Y-WIN_H)/2,mz,rot,false,outer,WIN_Y+WIN_H);
+    } else {
+      addWallSeg(ow,H-DOORH,mx,DOORH+(H-DOORH)/2,mz,rot,false,outer,DOORH);
+    }
+    buildFitting(op.o,mx,mz,ow,rot);
+    cur=e;
+  });
+  const [px,pz]=P((cur+len)/2); addWallSeg(len-cur,H,px,H/2,pz,rot,true,outer,0);
+});
+
+// ---------- 設備 ----------
+function box(w,h,d,color,x,y,z,collide){
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshLambertMaterial({color}));
+  m.position.set(x,y,z); m.castShadow=true; house.add(m);
+  if(collide) colliders.push({minX:x-w/2,maxX:x+w/2,minZ:z-d/2,maxZ:z+d/2,fit:null});
+  return m;
+}
+{ const [kx,kz]=px2w(455,272);
+  box(1.3,0.85,2.0,0xb8bcc2,kx+0.65,0.5,kz+1.0,true);
+  box(1.3,0.85,2.2,0xd0d4da,kx+0.65,0.5,kz+3.4,true);
+  box(1.0,0.05,0.5,0x222222,kx+0.65,0.95,kz+0.8,false);
+  box(0.6,0.03,0.9,0x9aa3ad,kx+0.65,0.93,kz+3.4,false);
+  const [bx,bz]=px2w(365,42); box(1.5,0.55,0.8,0xffffff,bx+0.75,0.35,bz+0.5,true);
+  const [tx,tz]=px2w(435,42); box(0.4,0.4,0.6,0xffffff,tx+0.5,0.3,tz+0.5,true);
+}
+
+// ---------- 天井 ----------
+{
+  const t=texCeil.clone(); t.needsUpdate=true; t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.repeat.set(455*S/0.9,795*S/0.9);
+  const ceilMat=new THREE.MeshLambertMaterial({map:t});
+  const ceil=new THREE.Mesh(new THREE.BoxGeometry(455*S,0.1,795*S),
+    [ceilMat,ceilMat,ceilMat,ceilMat,ceilMat,ceilMat]);
+  const [cx0,cz0]=px2w(42,38);
+  ceil.position.set(cx0+455*S/2,H+0.05,cz0+795*S/2); roofGroup.add(ceil);
+}
+roofGroup.visible=false;
+window.toggleRoof=function(){ roofGroup.visible=!roofGroup.visible; };
+
+// ---------- 建具開閉 ----------
+let allOpened=false;
+window.toggleDoors=function(){
+  allOpened=!allOpened;
+  fittings.forEach(f=>setFit(f,allOpened));
+};
+function setFit(f,open){
+  f.open=open;
+  f.parts.forEach(m=>{ m.target=open?1:0; });
+  if(f.collider) f.collider.disabled=open;
+}
+function animateDoors(){
+  movers.forEach(m=>{
+    m.cur+=(m.target-m.cur)*0.1;
+    if(m.type==='swing') m.obj.rotation.y=m.max*m.cur;
+    else m.obj.position.x=m.base+m.dir*m.dist*m.cur;
+  });
+}
+
+// ---------- 俯瞰カメラ ----------
+const cxm=(495-42)*S/2, czm=(828-38)*S/2;
+window.setView=function(t){
+  if(walking) exitWalk();
+  controls.target.set(cxm,0,czm);
+  if(t==='top') camera.position.set(cxm,45,czm+0.1);
+  else camera.position.set(cxm+22,24,czm+30);
+  controls.update();
+};
+
+// ---------- ウォークイン ----------
+let walking=false, yaw=0, pitch=0, locked=false;
+const EYE=1.55, RADIUS=0.22;
+const keys={};
+const pos=new THREE.Vector3();
+const dom=renderer.domElement;
+const elCross=document.getElementById('cross');
+const elHint=document.getElementById('hint');
+const elRoom=document.getElementById('room');
+const elHelp=document.getElementById('helpOrbit');
+let savedRoof=false;
+const startPos = px2w(160,238);
+
+window.toggleWalk=function(){ walking?exitWalk():enterWalk(); };
+
+function enterWalk(){
+  walking=true; controls.enabled=false;
+  pos.set(startPos[0],EYE,startPos[1]);
+  yaw=Math.PI; pitch=0;
+  savedRoof=roofGroup.visible; roofGroup.visible=true;
+  indoor.intensity=0.5;
+  labels.forEach(l=>l.visible=false);
+  camera.fov=70; camera.updateProjectionMatrix();
+  elCross.style.display='block'; elHint.style.display='block'; elRoom.style.display='block';
+  elHelp.textContent='ウォークイン中';
+  applyCamera();
+}
+function exitWalk(){
+  walking=false; controls.enabled=true;
+  if(document.pointerLockElement) document.exitPointerLock();
+  roofGroup.visible=savedRoof; indoor.intensity=0;
+  labels.forEach(l=>l.visible=true);
+  camera.fov=45; camera.updateProjectionMatrix();
+  elCross.style.display='none'; elHint.style.display='none'; elRoom.style.display='none';
+  elHelp.textContent='ドラッグ:回転 / ホイール:拡大縮小 / 右ドラッグ:移動';
+  controls.target.set(cxm,0,czm);
+  camera.position.set(cxm+22,24,czm+30);
+  camera.rotation.set(0,0,0);
+  controls.update();
+}
+function applyCamera(){
+  camera.position.copy(pos);
+  camera.rotation.order='YXZ';
+  camera.rotation.set(pitch,yaw,0);
+}
+dom.addEventListener('click',()=>{
+  if(walking && !document.pointerLockElement){ try{ dom.requestPointerLock(); }catch(e){} }
+});
+document.addEventListener('pointerlockchange',()=>{
+  locked = document.pointerLockElement===dom;
+  elHint.style.display = (walking&&!locked)?'block':'none';
+});
+document.addEventListener('mousemove',e=>{
+  if(!walking||!locked) return;
+  yaw   -= e.movementX*0.0022;
+  pitch -= e.movementY*0.0022;
+  pitch = Math.max(-1.3,Math.min(1.3,pitch));
+});
+addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='Enter'){ window.toggleWalk(); }
+  if(e.code==='KeyE' && walking){ interact(); }
+  if(walking && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+function interact(){
+  let best=null,bd=2.2;
+  const fwd=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw));
+  fittings.forEach(f=>{
+    if(f.type==='window'||f.type==='open') return;
+    const dx=f.x-pos.x, dz=f.z-pos.z, d=Math.hypot(dx,dz);
+    if(d>bd) return;
+    const dot=(dx*fwd.x+dz*fwd.z)/(d||1);
+    if(dot<0.2 && d>0.9) return;
+    best=f; bd=d;
+  });
+  if(best) setFit(best,!best.open);
+}
+function collides(x,z){
+  for(const c of colliders){
+    if(c.disabled) continue;
+    if(x>c.minX-RADIUS && x<c.maxX+RADIUS && z>c.minZ-RADIUS && z<c.maxZ+RADIUS) return true;
+  }
+  return false;
+}
+function updateWalk(dt){
+  const sp=(keys['ShiftLeft']||keys['ShiftRight']?4.0:1.8);
+  let f=0,s=0;
+  if(keys['KeyW']||keys['ArrowUp']) f+=1;
+  if(keys['KeyS']||keys['ArrowDown']) f-=1;
+  if(keys['KeyD']) s+=1;
+  if(keys['KeyA']) s-=1;
+  if(keys['ArrowLeft'])  yaw+=1.8*dt;
+  if(keys['ArrowRight']) yaw-=1.8*dt;
+  if(f||s){
+    const l=Math.hypot(f,s); f/=l; s/=l;
+    const fx=-Math.sin(yaw), fz=-Math.cos(yaw);
+    const rx= Math.cos(yaw), rz=-Math.sin(yaw);
+    const mx=(fx*f+rx*s)*sp*dt, mz=(fz*f+rz*s)*sp*dt;
+    if(!collides(pos.x+mx,pos.z)) pos.x+=mx;
+    if(!collides(pos.x,pos.z+mz)) pos.z+=mz;
+  }
+  applyCamera();
+  let name='',area=1e9;
+  roomRects.forEach(r=>{
+    if(pos.x>=r.x0&&pos.x<=r.x1&&pos.z>=r.z0&&pos.z<=r.z1){
+      const a=(r.x1-r.x0)*(r.z1-r.z0); if(a<area){area=a;name=r.n;}
+    }
+  });
+  elRoom.textContent = name?('現在地:'+name):'現在地:屋外';
+}
+
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+controls.target.set(cxm,0,czm);
+camera.position.set(cxm+22,24,czm+30);
+controls.update();
+
+let last=performance.now();
+(function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now(), dt=Math.min(0.05,(now-last)/1000); last=now;
+  animateDoors();
+  if(walking) updateWalk(dt); else controls.update();
+  renderer.render(scene,camera);
+})();
+})();
+</script>
+</body>
+</html>
